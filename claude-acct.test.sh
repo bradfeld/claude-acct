@@ -25,7 +25,10 @@ new_env() {
   STUB_LIVE="Claude Code-credentials-$(printf '%s' "$CLAUDE_CONFIG_DIR" | shasum -a 256 | cut -c1-8)"
   export STUB_LIVE CCJ="$CLAUDE_CONFIG_DIR/.claude.json"
   unset STUB_FAIL_WRITE STUB_CORRUPT_WRITE STUB_LOGIN_AS STUB_STATUS_EMAIL STUB_STATUS_SCRIPT STUB_STATUS_MODE \
-        STUB_CCJ_TOUCH CLAUDE_ACCT_CCJ_LOCK_WAIT BROWSER CLAUDE_SECURESTORAGE_CONFIG_DIR
+        STUB_CCJ_TOUCH CLAUDE_ACCT_CCJ_LOCK_WAIT BROWSER CLAUDE_SECURESTORAGE_CONFIG_DIR \
+        STUB_REFRESH_ON_READ STUB_MCP_REFRESH_ON_READ STUB_REFRESH_AFTER_ADD STUB_MCP_REFRESH_AFTER_ADD \
+        STUB_FAIL_WRITE_FROM STUB_REFRESH_ON_STATUS_FROM STUB_MCP_REFRESH_ON_STATUS_FROM STUB_FAIL_READ_AT \
+        STUB_NOW CLAUDE_ACCT_STATE_DIR
   export CLAUDE_ACCT_RETRY_SLEEP=0
   echo '{}' > "$STUB_KC"
   cat > "$T/bin/security" <<'PY'
@@ -40,20 +43,49 @@ def opts(a):
         if a[i] in ("-s", "-a", "-X", "-w") and i + 1 < len(a): o[a[i]] = a[i+1]; i += 2
         else: o[a[i]] = True; i += 1
     return o
+def bump(name):  # a per-test counter file next to the keychain: returns the new count
+    p = db + "." + name
+    n = (int(open(p).read()) if os.path.exists(p) else 0) + 1
+    open(p, "w").write(str(n)); return n
+def mutate(d, key, how):  # a running session rewriting the live item: its token, or one MCP login
+    try: v = json.loads(d[key])
+    except Exception: return
+    if how == "token": v["claudeAiOauth"]["accessToken"] = os.environ.get("STUB_MUTATE_TOKEN", "refreshed-by-test")
+    else:   # counts up, so a second MCP refresh changes the bytes again
+        m = v.setdefault("mcpOAuth", {}); m["test"] = {"refreshed": m.get("test", {}).get("refreshed", 0) + 1}
+    d[key] = json.dumps(v); save(d)
+def at(var, n):  # the hook names this read or write: one index, or a comma list of them
+    return str(n) in os.environ.get(var, "").split(",")
 def run(a):
     cmd, o = a[0], opts(a[1:])
     key = f'{o.get("-s")}|{o.get("-a")}'
+    live = o.get("-s") == os.environ["STUB_LIVE"]
     d = load()
     if cmd == "find-generic-password":
         if key not in d: return 44
+        if live:
+            n = bump("live-reads")
+            if at("STUB_FAIL_READ_AT", n): return 36            # a keychain read that fails, not "absent"
+            if at("STUB_REFRESH_ON_READ", n):
+                os.environ["STUB_MUTATE_TOKEN"] = "refreshed-on-read"; mutate(d, key, "token"); d = load()
+            if at("STUB_MCP_REFRESH_ON_READ", n): mutate(d, key, "mcp"); d = load()
         if "-w" in o: print(d[key])
         return 0
     if cmd == "add-generic-password":
         if key in d and "-U" not in o: return 45
         val = bytes.fromhex(o["-X"]).decode() if "-X" in o else o.get("-w", "")
+        if live: bump("live-write-attempts")        # counted even when the write silently fails
         if os.environ.get("STUB_FAIL_WRITE") == o.get("-s"): return 0   # silent non-persist
         if os.environ.get("STUB_CORRUPT_WRITE") == o.get("-s"): val = val[:-1]  # lands damaged
+        n = bump("live-writes") if live else 0
+        if live and os.environ.get("STUB_FAIL_WRITE_FROM") and n >= int(os.environ["STUB_FAIL_WRITE_FROM"]):
+            return 0                                                      # silent non-persist from the n-th
         d[key] = val; save(d)
+        # A running session refreshing the live item between the write and its read-back.
+        # The value names the live write it follows (1 = use's own write, 2 = the rollback's).
+        if live and at("STUB_REFRESH_AFTER_ADD", n):
+            os.environ["STUB_MUTATE_TOKEN"] = "refreshed-in-gap"; mutate(d, key, "token")
+        if live and at("STUB_MCP_REFRESH_AFTER_ADD", n): mutate(d, key, "mcp")
         # A running session writing .claude.json between the token write and the identity write.
         if os.environ.get("STUB_CCJ_TOUCH") and o.get("-s") == os.environ["STUB_LIVE"]:
             p = os.environ["CCJ"]; c = json.load(open(p)); c["concurrent"] = True
@@ -100,6 +132,17 @@ def ccj_load():
     try: return json.load(open(ccj))
     except Exception: return None
 if a[:2] == ["auth", "status"]:
+    # From the n-th status call on, a running session rewrites the live item (its token, or only
+    # an MCP login): the window after use's write, while it waits for the account to confirm.
+    cp = db + ".status-calls"
+    calls = (int(open(cp).read()) if os.path.exists(cp) else 0) + 1
+    open(cp, "w").write(str(calls))
+    for var, how in (("STUB_REFRESH_ON_STATUS_FROM", "token"), ("STUB_MCP_REFRESH_ON_STATUS_FROM", "mcp")):
+        if os.environ.get(var) and calls >= int(os.environ[var]) and live in d:
+            v = json.loads(d[live])
+            if how == "token": v["claudeAiOauth"]["accessToken"] = "refreshed-by-test"
+            else: v.setdefault("mcpOAuth", {})["test"] = {"refreshed": 1}
+            d[live] = json.dumps(v); json.dump(d, open(db, "w"))
     try: tok = json.loads(d[live])["claudeAiOauth"]
     except Exception: tok = None
     c = ccj_load()
@@ -137,6 +180,9 @@ sys.exit(2)
 PY
   # One argv element per line, so a lost quote (Google / Chrome as two tokens) is visible.
   printf '#!/bin/bash\nprintf "%%s\\n" "$@" >> "$STUB_OPEN_LOG"\n' > "$T/bin/open"
+  # A fixed clock for `date +%s` only when STUB_NOW is set; every other call, and every case that
+  # leaves STUB_NOW unset, runs the real date.
+  printf '#!/bin/bash\nif [ -n "${STUB_NOW:-}" ] && [ "$#" -eq 1 ] && [ "$1" = "+%%s" ]; then printf "%%s\\n" "$STUB_NOW"; exit 0; fi\nexec /bin/date "$@"\n' > "$T/bin/date"
   chmod +x "$T/bin/"*
   export PATH="$T/bin:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"
   mkdir -p "$HOME/.config/claude-acct"
@@ -676,30 +722,506 @@ rm -rf "$T"
 new_env; seed_live home@example.com
 L="$T/limits/latest"; mkdir -p "$L"; export CLAUDE_ACCT_LIMITS_DIR="$T/limits"
 mkdir -p "$HOME/.local/state/claude-acct"
-printf '%s\n' '{"ts":"2026-11-01T00:00:00Z","from":"ops@example.com","to":"home@example.com"}' \
+printf '%s\n' '{"ts":"2026-11-01T00:00:00Z","from":"ops.longest@example.test","to":"home@example.com"}' \
   '{"ts":"2026-11-02T00:00:00Z","from":"home@example.com","to":"fund@example.com"}' \
   > "$HOME/.local/state/claude-acct/switches.jsonl"
 now=$(date +%s); past=$((now - 3600)); future=$((now + 86400))
 cap=$(date -u -r $((now - 120)) +%Y-%m-%dT%H:%M:%SZ)
 printf '{"captured_at":"%s","email":"home@example.com","seven_day_pct":8,"seven_day_resets_at":%s,"five_hour_pct":12,"five_hour_resets_at":%s}\n' "$cap" "$future" "$future" > "$L/home@example.com.json"
-printf '{"captured_at":"%s","email":"ops@example.com","seven_day_pct":89,"seven_day_resets_at":%s}\n' "$cap" "$past" > "$L/ops@example.com.json"
+printf '{"captured_at":"%s","email":"ops.longest@example.test","seven_day_pct":89,"seven_day_resets_at":%s}\n' "$cap" "$past" > "$L/ops.longest@example.test.json"
 echo "2026-11-03T09:00:00Z" > "$L/.since"
+# a table of quota LEFT that fits a narrow pane (46 columns with these emails).
+line_of() { printf '%s\n' "$out" | grep -F -- "$1" | head -1; }
+fits46() { printf '%s\n' "$out" | awk '{ if (length > 46) bad=1 } END { exit bad }'; }
 out=$(bash "$SCRIPT" limits 2>&1); rc=$?
 [ $rc -eq 0 ] && ok "limits exits 0" || bad "limits exit" "rc=$rc $out"
-case "$out" in *"* home@example.com"*"8% of 7-day used, resets"*"5-hour 12%"*"reading 2m old"*) ok "limits shows the live account's percent, reset, 5-hour, and age" ;;
-  *) bad "live account line wrong" "$out" ;; esac
-case "$out" in *"ops@example.com"*"7-day window reset"*"89% before it"*) ok "limits says a passed reset instead of showing a stale percent" ;;
-  *) bad "past reset not reported as reset" "$out" ;; esac
-case "$out" in *"fund@example.com"*"no reading since"*) ok "limits says no reading, not 0%, for an account with no file" ;;
-  *) bad "account with no reading misreported" "$out" ;; esac
-case "$out" in *"fund@example.com"*" 0%"*) bad "an account with no data printed as 0%" "$out" ;; *) ok "no account without data prints 0%" ;; esac
+fits46 && ok "limits: every line fits 46 columns" || bad "limits: a line is wider than 46" "$out"
+case "$(printf '%s\n' "$out" | head -1)" in "  ACCOUNT"*" LEFT  RESETS") ok "limits: header names ACCOUNT, LEFT, RESETS" ;; *) bad "limits header" "$out" ;; esac
+row=$(line_of "* home@example.com")
+printf '%s\n' "$row" | grep -Eq '^\* home@example\.com +92%  [A-Z][a-z][a-z] [0-9]{1,2} [0-9]{1,2}:[0-9][0-9][ap]$' \
+  && ok "limits: the live account shows 92% left and a short reset" || bad "live account row" "$row"
+row=$(line_of "ops.longest@example.test")
+printf '%s\n' "$row" | grep -Eq ' +-  was [0-9]{1,2} [0-9]{1,2}:[0-9][0-9][ap]$' \
+  && ok "limits: a passed reset shows - and was <when>, not a stale percent" || bad "past reset row" "$row"
+row=$(line_of "fund@example.com")
+printf '%s\n' "$row" | grep -Eq ' +-  no reading$' && ok "limits: an account with no file reads - no reading" || bad "no-reading row" "$row"
+case "$row" in *"0%"*) bad "an account with no data printed as 0%" "$row" ;; *) ok "no account without data prints 0%" ;; esac
+case "$out" in *"7-day quota · times "*) ok "limits: the footer names the zone once" ;; *) bad "zone footer missing" "$out" ;; esac
+# the statusline payload carries no per-model weekly cap, so the footer says so.
+case "$(printf '%s\n' "$out" | tr '\n' ' ' | tr -s ' ')" in
+  *"Per-model weekly caps (Fable) are not in the statusline payload"*) ok "limits: the footer says per-model caps are not shown" ;;
+  *) bad "per-model cap caveat missing from the footer" "$out" ;; esac
+case "$out" in *"5h: home@example.com 12%"*) ok "limits: an unexpired 5-hour reading is on a footer line" ;; *) bad "5h footer missing" "$out" ;; esac
+case "$out" in *"(reading"*|*"kept since"*|*"stale (>1h)"*) bad "limits printed a per-row age, the since footer, or a stale line with no stale reading" "$out" ;; *) ok "limits: no per-row age, no since footer, no stale line when nothing is stale" ;; esac
+# A reading older than an hour gets the stale footer; a fractional percent stays 4 wide.
+old=$(date -u -r $((now - 10800)) +%Y-%m-%dT%H:%M:%SZ)
+printf '{"captured_at":"%s","email":"fund@example.com","seven_day_pct":22.5,"seven_day_resets_at":%s}\n' "$old" "$future" > "$L/fund@example.com.json"
+out=$(bash "$SCRIPT" limits 2>&1)
+case "$out" in *"stale (>1h): fund@example.com 3h"*) ok "limits: a 3h-old reading is named on the stale footer" ;; *) bad "stale footer" "$out" ;; esac
+row=$(line_of "fund@example.com ")
+printf '%s\n' "$row" | grep -Eq ' 78%  ' && ok "limits: 22.5% used prints 78% left, 4 wide" || bad "fractional percent" "$row"
+fits46 && ok "limits: still fits 46 with a stale footer" || bad "stale footer overflows" "$out"
+# Many stale accounts: the footer wraps instead of overflowing.
+mkdir -p "$HOME/.config/claude-acct"
+printf 'a\tone@stale.example\nb\ttwo@stale.example\nc\tthree@stale.example\nd\tfour@stale.example\n' > "$HOME/.config/claude-acct/accounts"
+for e in one two three four; do
+  printf '{"captured_at":"%s","email":"%s@stale.example","seven_day_pct":10,"seven_day_resets_at":%s}\n' "$old" "$e" "$future" > "$L/$e@stale.example.json"
+done
+out=$(bash "$SCRIPT" limits 2>&1)
+fits46 && case "$out" in *"four@stale.example 3h"*) true ;; *) false ;; esac \
+  && ok "limits: a long stale footer wraps within 46" || bad "long stale footer" "$out"
+# A 30+ character email widens the column; every row and the header stay aligned to it.
+LONG=a.very.long.address@example.test
+printf 'a\t%s\n' "$LONG" > "$HOME/.config/claude-acct/accounts"
+out=$(bash "$SCRIPT" limits 2>&1)
+# header = 2 + W + " LEFT  RESETS"; a row's LEFT value ends at column 2 + W + 5, under the header's LEFT.
+endleft=$((2 + ${#LONG} + 5))
+hdr=$(printf '%s\n' "$out" | head -1); row=$(line_of "fund@example.com ")
+[ "${#hdr}" -eq $((2 + ${#LONG} + 13)) ] && [ "$(printf '%s' "$hdr" | cut -c$((endleft - 3))-$endleft)" = "LEFT" ] \
+  && [ "$(printf '%s' "$row" | cut -c$((endleft - 2))-$endleft)" = "78%" ] \
+  && ok "limits: a ${#LONG}-character email widens the column, header and rows aligned" || bad "long email alignment" "$(printf '%s\n' "$out" | awk '{print length": "$0}')"
+rm -f "$HOME/.config/claude-acct/accounts"
 rm -r "$L"
 out=$(bash "$SCRIPT" limits 2>&1)
-case "$out" in *"no readings recorded yet"*"none kept yet"*) ok "limits with no latest dir says nothing is kept yet" ;;
+case "$out" in *"home@example.com"*"-  no reading"*) ok "limits with no latest dir reads no reading" ;;
   *) bad "missing latest dir misreported" "$out" ;; esac
+# The widest RESETS (2-digit day and hour) on the 24-character email is exactly 46, pinned by
+# fixed epochs under TZ=UTC rather than by whatever day the suite runs on.
+mkdir -p "$L"
+reading() {  # $1 email  $2 the JSON fields after captured_at
+  printf '{"captured_at":"%s",%s}\n' "$cap" "$2" > "$L/$1.json"
+}
+reading ops.longest@example.test '"seven_day_pct":10,"seven_day_resets_at":4101057000'   # Tue 15 10:30p UTC
+reading fund@example.com '"seven_day_pct":50,"seven_day_resets_at":1605222000'            # was 12 11:00p UTC
+reading home@example.com '"seven_day_pct":130,"seven_day_resets_at":4101057000'
+out=$(TZ=UTC bash "$SCRIPT" limits 2>&1)
+row=$(line_of "ops.longest@example.test")
+[ "$row" = "$(printf '  %-24s %4s  %s' ops.longest@example.test 90% 'Tue 15 10:30p')" ] && [ ${#row} -eq 46 ] \
+  && ok "limits: the widest live row is exactly 46" || bad "widest live row" "${#row}: $row"
+row=$(line_of "fund@example.com")
+[ "$row" = "$(printf '  %-24s %4s  %s' fund@example.com - 'was 12 11:00p')" ] && [ ${#row} -eq 46 ] \
+  && ok "limits: the widest passed-reset row is exactly 46" || bad "widest was row" "${#row}: $row"
+row=$(line_of "home@example.com")
+printf '%s\n' "$row" | grep -Eq ' 0%  Tue 15' && ok "limits: over 100% used clamps to 0% left" || bad "clamp high" "$row"
+case "$out" in *"times UTC"*) ok "limits: the footer names the zone of the times shown" ;; *) bad "UTC footer" "$out" ;; esac
+# Below 0% used clamps to 100%; no reset time reads unknown; a bad capture time is stale "?";
+# a 5-hour reading is shown even when the 7-day one is missing.
+reading home@example.com '"seven_day_pct":-5'
+reading ops.longest@example.test '"seven_day_pct":10,"seven_day_resets_at":4101057000'
+sed -i '' 's/"captured_at":"[^"]*"/"captured_at":"junk"/' "$L/ops.longest@example.test.json"
+reading fund@example.com '"seven_day_pct":null,"five_hour_pct":30,"five_hour_resets_at":4101057000'
+out=$(TZ=UTC bash "$SCRIPT" limits 2>&1)
+row=$(line_of "home@example.com")
+printf '%s\n' "$row" | grep -Eq '100%  unknown$' && ok "limits: below 0% used clamps to 100%, no reset reads unknown" || bad "clamp low / unknown" "$row"
+case "$out" in *"stale (>1h): ops.longest@example.test ?"*) ok "limits: an unreadable capture time is listed stale with age ?" ;; *) bad "bad captured_at read as fresh" "$out" ;; esac
+row=$(line_of "fund@example.com")
+printf '%s\n' "$row" | grep -Eq ' -  no reading$' && case "$out" in *"5h: fund@example.com 30%"*) true ;; *) false ;; esac \
+  && ok "limits: a 5-hour reading shows without a 7-day one" || bad "5h without 7-day" "$out"
+fits46 && ok "limits: clamp, unknown, and footers fit 46" || bad "overflow" "$out"
+# A malformed file costs its own row: not JSON, a string percent, NaN, a non-object.
+printf 'not json\n' > "$L/home@example.com.json"
+reading ops.longest@example.test '"seven_day_pct":"x","seven_day_resets_at":4101057000'
+reading fund@example.com '"seven_day_pct":NaN,"seven_day_resets_at":4101057000'
+out=$(TZ=UTC bash "$SCRIPT" limits 2>&1); rc=$?
+n=$(printf '%s\n' "$out" | grep -cE ' -  unreadable$' || true)
+[ $rc -eq 0 ] && [ "$n" -eq 3 ] && case "$out" in *"7-day quota · times"*"unreadable reading: "*) true ;; *) false ;; esac \
+  && ok "limits: malformed readings each read unreadable, and the table still finishes" || bad "malformed readings" "rc=$rc n=$n $out"
+printf '[1]\n' > "$L/fund@example.com.json"
+out=$(TZ=UTC bash "$SCRIPT" limits 2>&1)
+printf '%s\n' "$(line_of "fund@example.com")" | grep -Eq ' -  unreadable$' && ok "limits: a non-object reading reads unreadable" || bad "non-object reading" "$out"
+# Times on both sides of a DST change name both zones.
+rm -f "$L"/*.json
+reading ops.longest@example.test '"seven_day_pct":10,"seven_day_resets_at":4087816200'  # July: MDT
+reading fund@example.com '"seven_day_pct":50,"seven_day_resets_at":1605222000'          # November: MST
+out=$(TZ=America/Denver bash "$SCRIPT" limits 2>&1)
+case "$out" in *"times MDT/MST"*|*"times MST/MDT"*) ok "limits: times in two zones name both" ;; *) bad "DST zones" "$out" ;; esac
 out=$(bash "$SCRIPT" limits extra 2>&1); rc=$?
 [ $rc -eq 1 ] && ok "limits refuses arguments" || bad "limits took an argument" "rc=$rc $out"
+rm -rf "$T"
+# No known accounts (no accounts file, no switch log, nothing live): the message alone, within 46.
+new_env; export CLAUDE_ACCT_LIMITS_DIR="$T/limits"; rm -f "$HOME/.config/claude-acct/accounts"
+out=$(bash "$SCRIPT" limits 2>&1); rc=$?
+[ $rc -eq 0 ] && case "$out" in "no accounts known yet"*) true ;; *) false ;; esac && fits46 \
+  && ok "limits with no known accounts says so within 46" || bad "no-accounts message" "rc=$rc $out"
 unset CLAUDE_ACCT_LIMITS_DIR
+rm -rf "$T"
+
+# ── list --json, use --expect-from, the re-reads, live_class, where, chrome ──────
+acct_file() { printf '%b' "$1" > "$HOME/.config/claude-acct/accounts"; }
+# A slot carrying named secret values, so a no-credential check has something it could leak.
+seed_secret_slot() {  # $1 email  $2 alias
+  python3 - "$1" "$2" <<'PY'
+import json, os, sys, time
+d = json.load(open(os.environ["STUB_KC"]))
+d["claude-acct/" + sys.argv[1] + "|" + os.environ["USER"]] = json.dumps({
+  "claudeAiOauth": {"accessToken": "at-secret-" + sys.argv[2], "refreshToken": "rt-secret-" + sys.argv[2],
+                    "refreshTokenExpiresAt": int((time.time() + 30 * 86400) * 1000)},
+  "oauthAccount": {"emailAddress": sys.argv[1], "accountUuid": "uuid-" + sys.argv[1]}})
+json.dump(d, open(os.environ["STUB_KC"], "w"))
+PY
+}
+mcp_test_key() { kc_get "$STUB_LIVE" '.mcpOAuth.test.refreshed // empty'; }
+
+# 20 — list --json: one object per account, fourth-column lastResort, nulls where nothing is known
+new_env; seed_live alpha@x.test; seed_slot alpha@x.test; seed_slot beta@x.test
+acct_file 'a\talpha@x.test\tProfile 1\tlastResort\nb\tbeta@x.test\nc\tgamma@x.test\t\tlastResort\n'
+out=$(bash "$SCRIPT" list --json 2>/dev/null); rc=$?
+[ $rc -eq 0 ] && printf '%s' "$out" | jq -e 'length==3 and .[0].email=="alpha@x.test" and .[0].last_resort==true
+    and .[0].chrome_profile=="Profile 1" and .[0].live==true and .[0].saved==true and .[0].slot_ok==true
+    and .[0].alias=="a" and .[1].alias=="b" and .[1].last_resort==false and .[1].live==false
+    and .[2].chrome_profile==null and .[2].last_resort==true and .[2].saved==false and .[2].slot_ok==false
+    and .[2].refresh_until==null and .[2].refresh_expires_in_days==null and .[2].slot_problem==null
+    and (.[0]|has("refresh_expires_in_days"))' >/dev/null \
+  && ok "list --json: one object per account, lastResort read positionally, nulls when unknown" \
+  || bad "list --json shape" "rc=$rc $out"
+rm -rf "$T"
+# 20b — a fourth column that is not the literal lastResort is not last-resort
+new_env; seed_live alpha@x.test
+acct_file 'a\talpha@x.test\t\tlastresort\nb\tbeta@x.test\t\tyes\n'
+out=$(bash "$SCRIPT" list --json 2>/dev/null)
+printf '%s' "$out" | jq -e 'length==2 and all(.[]; .last_resort==false)' >/dev/null \
+  && ok "list --json: only the literal lastResort counts" || bad "a non-literal fourth column read as lastResort" "$out"
+rm -rf "$T"
+# 20c — refresh-token expiry: 3.5 days out lists 3 days, a day past lists expired; a bad slot says why
+new_env; seed_live alpha@x.test
+acct_file 'a\talpha@x.test\nsoon\tsoon@x.test\nold\told@x.test\nmix\tmix@x.test\n'
+seed_slot soon@x.test "" 3.5; seed_slot old@x.test "" -1; seed_slot mix@x.test acct:other@x.test 30
+out=$(bash "$SCRIPT" list --json 2>/dev/null)
+printf '%s' "$out" | jq -e '(.[] | select(.email=="soon@x.test")) as $s | (.[] | select(.email=="old@x.test")) as $o
+    | (.[] | select(.email=="mix@x.test")) as $m
+    | $s.refresh_expires_in_days==3 and $s.refresh_expired==false and ($s.refresh_until|test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$"))
+    and $o.refresh_expired==true and $m.slot_ok==false and $m.saved==true
+    and $m.slot_problem=="identity of '"'"'other@x.test'"'"'"' >/dev/null \
+  && ok "list --json: expiry in days, expired, and the slot problem text" || bad "list --json expiry or slot problem" "$out"
+rm -rf "$T"
+# 20d — list --json prints no credential, from slots that carry named secrets
+new_env; seed_live alpha@x.test; seed_secret_slot alpha@x.test a; seed_secret_slot beta@x.test b
+acct_file 'a\talpha@x.test\nb\tbeta@x.test\n'
+out=$(bash "$SCRIPT" list --json 2>&1)
+case "$out" in *at-secret-*|*rt-secret-*|*TOK-*|*MCP-LINEAR-SECRET*) bad "list --json printed a credential" "$out" ;;
+  *) printf '%s' "$out" | jq -e 'length==2' >/dev/null && ok "list --json prints no access or refresh token" \
+       || bad "list --json did not list the seeded slots" "$out" ;; esac
+rm -rf "$T"
+# 20e — with no account live, list --json is still one valid array, every live false, exit 0
+new_env
+acct_file 'a\talpha@x.test\n'
+out=$(bash "$SCRIPT" list --json 2>/dev/null); rc=$?
+[ $rc -eq 0 ] && printf '%s' "$out" | jq -e 'type=="array" and length==1 and all(.[]; .live==false)' >/dev/null \
+  && ok "list --json with no live account: valid array, nothing live, exit 0" || bad "list --json logged out" "rc=$rc $out"
+rm -rf "$T"
+# 20f — list refuses any argument other than one --json; plain list is unchanged (test 9)
+new_env; seed_live home@example.com
+out=$(bash "$SCRIPT" list --bogus 2>&1); rc=$?
+[ $rc -eq 1 ] && case "$out" in *"usage: claude-acct.sh list [--json]"*) true ;; *) false ;; esac \
+  && ok "list --bogus: exit 1 with the list usage line" || bad "list accepted an unknown argument" "rc=$rc $out"
+bash "$SCRIPT" list --json --json >/dev/null 2>&1; rc=$?
+[ $rc -eq 1 ] && ok "list --json --json: exit 1" || bad "list accepted --json twice" "rc=$rc"
+bash "$SCRIPT" list >/dev/null 2>&1; rc=$?
+[ $rc -eq 0 ] && ok "plain list still exits 0" || bad "plain list broke" "rc=$rc"
+rm -rf "$T"
+
+# 21 — use --expect-from: a mismatch is refused under the lock, nothing changes
+new_env; seed_live home@example.com; seed_slot work@example.com
+snap=$(snapshot)
+out=$(bash "$SCRIPT" use work --no-chrome --expect-from gamma@x.test 2>&1); rc=$?
+[ $rc -eq 2 ] && [ "$(snapshot)" = "$snap" ] && case "$out" in *expect*) true ;; *) false ;; esac \
+  && ok "--expect-from naming another account: exit 2, nothing changed" || bad "--expect-from mismatch" "rc=$rc $out"
+out=$(bash "$SCRIPT" use work --no-chrome --expect-from home@example.com 2>&1); rc=$?
+[ $rc -eq 0 ] && [ "$(ccj_email)" = "work@example.com" ] \
+  && [ "$(kc_get "$STUB_LIVE" .claudeAiOauth.accessToken)" = "TOK-work@example.com-slot" ] \
+  && ok "--expect-from naming the live account: the switch runs" || bad "--expect-from match did not switch" "rc=$rc $out"
+rm -rf "$T"
+new_env; seed_live home@example.com; seed_slot work@example.com
+snap=$(snapshot)
+out=$(bash "$SCRIPT" use work --expect-from 2>&1); rc=$?
+[ $rc -eq 1 ] && [ "$(snapshot)" = "$snap" ] && case "$out" in *"usage: claude-acct.sh use"*) true ;; *) false ;; esac \
+  && ok "--expect-from with no value: exit 1 with the usage line, nothing changed" || bad "--expect-from missing value" "rc=$rc $out"
+bash "$SCRIPT" use work --expect-from a@x.test --expect-from b@x.test >/dev/null 2>&1; rc=$?
+[ $rc -eq 1 ] && [ "$(snapshot)" = "$snap" ] && ok "--expect-from twice: exit 1, nothing changed" || bad "--expect-from twice" "rc=$rc"
+rm -rf "$T"
+
+# 21b — use --not-after: checked under the lock, before the live account is read
+new_env; seed_live home@example.com; seed_slot work@example.com
+snap=$(snapshot)
+past=$(( $(/bin/date +%s) - 3600 ))
+out=$(bash "$SCRIPT" use work --no-chrome --not-after "$past" 2>&1); rc=$?
+[ $rc -eq 2 ] && [ "$(snapshot)" = "$snap" ] && case "$out" in *"past --not-after $past; nothing was switched"*) true ;; *) false ;; esac \
+  && ! grep -q add-generic-password "$STUB_ARGV_LOG" 2>/dev/null \
+  && [ ! -e "$HOME/.local/state/claude-acct/lock" ] && [ ! -L "$HOME/.local/state/claude-acct/lock" ] \
+  && ok "--not-after an hour ago: exit 2, no keychain write, the lock released" \
+  || bad "--not-after in the past" "rc=$rc $out"
+future=$(( $(/bin/date +%s) + 3600 ))
+out=$(bash "$SCRIPT" use work --no-chrome --not-after "$future" 2>&1); rc=$?
+[ $rc -eq 0 ] && [ "$(ccj_email)" = "work@example.com" ] \
+  && [ "$(kc_get "$STUB_LIVE" .claudeAiOauth.accessToken)" = "TOK-work@example.com-slot" ] \
+  && ok "--not-after an hour ahead: the switch lands as without the flag" || bad "--not-after in the future" "rc=$rc $out"
+rm -rf "$T"
+# The boundary on a fixed clock: the named second itself is admitted, one second earlier is not.
+new_env; seed_live home@example.com; seed_slot work@example.com
+export STUB_NOW=1700000000
+snap=$(snapshot)
+out=$(bash "$SCRIPT" use work --no-chrome --not-after 1699999999 2>&1); rc=$?
+[ $rc -eq 2 ] && [ "$(snapshot)" = "$snap" ] && case "$out" in *"past --not-after 1699999999"*) true ;; *) false ;; esac \
+  && ok "--not-after one second before now: refused (exit 2)" || bad "--not-after one second past" "rc=$rc $out"
+out=$(bash "$SCRIPT" use work --no-chrome --not-after 1700000000 2>&1); rc=$?
+[ $rc -eq 0 ] && [ "$(ccj_email)" = "work@example.com" ] \
+  && ok "--not-after naming the current second: admitted" || bad "--not-after at the current second" "rc=$rc $out"
+unset STUB_NOW
+rm -rf "$T"
+new_env; seed_live home@example.com; seed_slot work@example.com
+snap=$(snapshot)
+bash "$SCRIPT" use work --no-chrome --not-after 4102444800 --not-after 4102444800 >/dev/null 2>&1; rc=$?
+[ $rc -eq 1 ] && [ "$(snapshot)" = "$snap" ] && ok "--not-after twice: exit 1, nothing changed" || bad "--not-after twice" "rc=$rc"
+bash "$SCRIPT" use work --no-chrome --not-after soon >/dev/null 2>&1; rc=$?
+[ $rc -eq 1 ] && [ "$(snapshot)" = "$snap" ] && ok "--not-after soon: exit 1, nothing changed" || bad "--not-after non-numeric" "rc=$rc"
+bash "$SCRIPT" use work --no-chrome --not-after >/dev/null 2>&1; rc=$?
+[ $rc -eq 1 ] && [ "$(snapshot)" = "$snap" ] && ok "--not-after with no value: exit 1, nothing changed" || bad "--not-after missing value" "rc=$rc"
+rm -rf "$T"
+
+# 22 — the live login refreshed between use's read and its write: abort, write nothing live
+# Live-item reads in use: 1 read_live_as, 2 the re-read just before kc_write.
+new_env; seed_live home@example.com; seed_slot work@example.com
+ccj_before=$(jq -cS . "$CCJ")
+export STUB_REFRESH_ON_READ=2
+out=$(bash "$SCRIPT" use work --no-chrome 2>&1); rc=$?
+unset STUB_REFRESH_ON_READ
+[ $rc -eq 2 ] && case "$out" in *"live login changed"*) true ;; *) false ;; esac \
+  && [ "$(kc_get "$STUB_LIVE" .claudeAiOauth.accessToken)" = "refreshed-on-read" ] \
+  && [ "$(jq -cS . "$CCJ")" = "$ccj_before" ] \
+  && ok "a refresh before the write aborts with exit 2; the refreshed login and .claude.json are untouched" \
+  || bad "a changed live login was overwritten" "rc=$rc $out"
+rm -rf "$T"
+
+# 23 — after use's write lands, a session writes a token this run never saw: exit 4, rewrite nothing
+new_env; seed_live home@example.com; seed_slot work@example.com
+export STUB_STATUS_SCRIPT="$T/status-script"; printf 'ok ok fail fail fail' > "$STUB_STATUS_SCRIPT"
+export STUB_REFRESH_ON_STATUS_FROM=3
+out=$(bash "$SCRIPT" use work --no-chrome 2>&1); rc=$?
+unset STUB_STATUS_SCRIPT STUB_REFRESH_ON_STATUS_FROM
+[ $rc -eq 4 ] && [ "$(kc_get "$STUB_LIVE" .claudeAiOauth.accessToken)" = "refreshed-by-test" ] \
+  && [ "$(ccj_email)" = "work@example.com" ] \
+  && case "$out" in *"claude auth login --email home@example.com"*) true ;; *) false ;; esac \
+  && case "$out" in *"the token's owner is unknown"*) true ;; *) false ;; esac \
+  && case "$out" in *save*) false ;; *) true ;; esac \
+  && ok "a foreign token after the write: exit 4, neither record rewritten, sign-in advice, never save" \
+  || bad "a foreign token was clobbered or misreported" "rc=$rc $out"
+rm -rf "$T"
+
+# 24 — a session rewrites the token between use's write and its read-back: exit 4, .claude.json untouched
+new_env; seed_live home@example.com; seed_slot work@example.com
+ccj_before=$(jq -cS . "$CCJ")
+export STUB_REFRESH_AFTER_ADD=1
+out=$(bash "$SCRIPT" use work --no-chrome 2>&1); rc=$?
+unset STUB_REFRESH_AFTER_ADD
+[ $rc -eq 4 ] && [ "$(kc_get "$STUB_LIVE" .claudeAiOauth.accessToken)" = "refreshed-in-gap" ] \
+  && [ "$(jq -cS . "$CCJ")" = "$ccj_before" ] \
+  && case "$out" in *"the token's owner is unknown"*"claude auth login --email home@example.com"*) true ;; *) false ;; esac \
+  && ok "a token written into the read-back gap: exit 4, .claude.json untouched, the session's token kept" \
+  || bad "the read-back gap refresh" "rc=$rc $out"
+rm -rf "$T"
+
+# 25 — only an MCP login changes in the read-back gap: the token landed, so the switch continues
+new_env; seed_live home@example.com; seed_slot work@example.com
+export STUB_MCP_REFRESH_AFTER_ADD=1
+out=$(bash "$SCRIPT" use work --no-chrome 2>&1); rc=$?
+unset STUB_MCP_REFRESH_AFTER_ADD
+[ $rc -eq 0 ] && [ "$(kc_get "$STUB_LIVE" .claudeAiOauth.accessToken)" = "TOK-work@example.com-slot" ] \
+  && [ "$(mcp_test_key)" = "1" ] && [ "$(ccj_email)" = "work@example.com" ] \
+  && ok "an MCP-only refresh in the read-back gap: the switch stands, the MCP change survives" \
+  || bad "an MCP-only refresh failed the switch or was lost" "rc=$rc $out"
+rm -rf "$T"
+
+# 26 — an MCP-only refresh during a failed confirmation: restore only the token, keep the MCP change
+new_env; seed_live home@example.com; seed_slot work@example.com
+export STUB_STATUS_SCRIPT="$T/status-script"; printf 'ok ok fail fail fail' > "$STUB_STATUS_SCRIPT"
+export STUB_MCP_REFRESH_ON_STATUS_FROM=3
+bash "$SCRIPT" use work --no-chrome >/dev/null 2>&1; rc=$?
+unset STUB_STATUS_SCRIPT STUB_MCP_REFRESH_ON_STATUS_FROM
+[ $rc -eq 3 ] && [ "$(kc_get "$STUB_LIVE" .claudeAiOauth.accessToken)" = "TOK-home@example.com" ] \
+  && [ "$(mcp_test_key)" = "1" ] && [ "$(ccj_email)" = "home@example.com" ] \
+  && ok "a failed switch restores only the token part; an MCP refresh in the window survives (exit 3)" \
+  || bad "the rollback clobbered an MCP refresh" "rc=$rc"
+rm -rf "$T"
+
+# 27 — the rollback's own token write fails: the identity is not rewritten over the target's token
+# Live-item writes: 1 use's own write, 2 the rollback.
+new_env; seed_live home@example.com; seed_slot work@example.com
+export STUB_STATUS_SCRIPT="$T/status-script"; printf 'ok ok fail fail fail' > "$STUB_STATUS_SCRIPT"
+export STUB_FAIL_WRITE_FROM=2
+out=$(bash "$SCRIPT" use work --no-chrome 2>&1); rc=$?
+unset STUB_STATUS_SCRIPT STUB_FAIL_WRITE_FROM
+[ $rc -eq 4 ] && [ "$(kc_get "$STUB_LIVE" .claudeAiOauth.accessToken)" = "TOK-work@example.com-slot" ] \
+  && [ "$(ccj_email)" = "work@example.com" ] \
+  && case "$out" in *"restoring home@example.com failed"*"claude auth login --email home@example.com"*) true ;; *) false ;; esac \
+  && ok "a failed token restore leaves token and identity on one account, exit 4" \
+  || bad "the identity was restored over a token that stayed the target's" "rc=$rc $out"
+rm -rf "$T"
+
+# 28 — the rollback reads fresh: an MCP change on its classify read (A) or its compare read (B) survives
+# Live-item reads on this path: 1 read_live_as, 2 the pre-write re-read, 3 kc_write's read-back,
+# 4 the rollback's classify read (A), 5 its compare read just before the write (B).
+for case_n in 4 5; do
+  new_env; seed_live home@example.com; seed_slot work@example.com
+  export STUB_STATUS_SCRIPT="$T/status-script"; printf 'ok ok fail fail fail' > "$STUB_STATUS_SCRIPT"
+  export STUB_MCP_REFRESH_ON_READ=$case_n
+  bash "$SCRIPT" use work --no-chrome >/dev/null 2>&1; rc=$?
+  unset STUB_STATUS_SCRIPT STUB_MCP_REFRESH_ON_READ
+  [ $rc -eq 3 ] && [ "$(kc_get "$STUB_LIVE" .claudeAiOauth.accessToken)" = "TOK-home@example.com" ] \
+    && [ "$(mcp_test_key)" = "1" ] \
+    && ok "the rollback composes from its freshest read (MCP change on live read $case_n survives)" \
+    || bad "the rollback wrote stale bytes (MCP change on live read $case_n lost)" "rc=$rc"
+  rm -rf "$T"
+done
+
+# 28b — save and use serialize: with the lock held by a live pid, use says so and changes nothing
+new_env; seed_live home@example.com; seed_slot work@example.com
+mkdir -p "$HOME/.local/state/claude-acct"; ln -s "$$" "$HOME/.local/state/claude-acct/lock"
+snap=$(snapshot)
+out=$(bash "$SCRIPT" use work --no-chrome --expect-from home@example.com 2>&1); rc=$?
+[ $rc -eq 2 ] && [ "$(snapshot)" = "$snap" ] && case "$out" in *"holds the lock"*) true ;; *) false ;; esac \
+  && ok "use under a held lock: exit 2, says another run holds the lock, nothing changed" \
+  || bad "use under a held lock" "rc=$rc $out"
+rm -rf "$T"
+
+# Live-item reads on the confirm-failure path: 1 read_live_as, 2 the pre-write re-read, 3 kc_write's
+# read-back, 4 the rollback's classify read (A), 5 its compare read (B), 6 the compare after a
+# reclassification (B2). Live writes: 1 use's own, 2 the rollback's.
+live_writes() { cat "$STUB_KC.live-writes" 2>/dev/null || echo 0; }
+
+# 31 — the bytes move twice before the rollback writes, and the newest read is a foreign token:
+#      exit 4, the rollback writes nothing over it
+new_env; seed_live home@example.com; seed_slot work@example.com
+export STUB_STATUS_SCRIPT="$T/status-script"; printf 'ok ok fail fail fail' > "$STUB_STATUS_SCRIPT"
+export STUB_MCP_REFRESH_ON_READ=5 STUB_REFRESH_ON_READ=6
+out=$(bash "$SCRIPT" use work --no-chrome 2>&1); rc=$?
+unset STUB_STATUS_SCRIPT STUB_MCP_REFRESH_ON_READ STUB_REFRESH_ON_READ
+[ $rc -eq 4 ] && [ "$(live_writes)" = "1" ] && [ "$(kc_get "$STUB_LIVE" .claudeAiOauth.accessToken)" = "refreshed-on-read" ] \
+  && case "$out" in *"the token's owner is unknown"*) true ;; *) false ;; esac \
+  && ok "bytes moving twice to a foreign token: exit 4, no rollback write over it" \
+  || bad "the rollback wrote stale bytes over a newly seen foreign token" "rc=$rc writes=$(live_writes) $out"
+rm -rf "$T"
+# 31b — the bytes move twice (MCP-only both times): never write a composition the newest read did not
+#       produce; exit 4 with the restore-failed advice, the target's token and both MCP changes intact
+new_env; seed_live home@example.com; seed_slot work@example.com
+export STUB_STATUS_SCRIPT="$T/status-script"; printf 'ok ok fail fail fail' > "$STUB_STATUS_SCRIPT"
+export STUB_MCP_REFRESH_ON_READ=5,6
+out=$(bash "$SCRIPT" use work --no-chrome 2>&1); rc=$?
+unset STUB_STATUS_SCRIPT STUB_MCP_REFRESH_ON_READ
+[ $rc -eq 4 ] && [ "$(live_writes)" = "1" ] && [ "$(mcp_test_key)" = "2" ] \
+  && [ "$(kc_get "$STUB_LIVE" .claudeAiOauth.accessToken)" = "TOK-work@example.com-slot" ] \
+  && case "$out" in *"AND restoring home@example.com failed"*"claude auth login --email home@example.com"*) true ;; *) false ;; esac \
+  && ok "bytes still moving at the second compare: exit 4, nothing written over them" \
+  || bad "the rollback wrote over bytes that kept moving" "rc=$rc writes=$(live_writes) mcp=$(mcp_test_key) $out"
+rm -rf "$T"
+
+# 32 — the rollback's write lands, and only an MCP login changes in its read-back gap: the token is
+#      the original, so the identity is restored too (exit 3), not left on the target
+new_env; seed_live home@example.com; seed_slot work@example.com
+export STUB_STATUS_SCRIPT="$T/status-script"; printf 'ok ok fail fail fail' > "$STUB_STATUS_SCRIPT"
+export STUB_MCP_REFRESH_AFTER_ADD=2
+bash "$SCRIPT" use work --no-chrome >/dev/null 2>&1; rc=$?
+unset STUB_STATUS_SCRIPT STUB_MCP_REFRESH_AFTER_ADD
+[ $rc -eq 3 ] && [ "$(kc_get "$STUB_LIVE" .claudeAiOauth.accessToken)" = "TOK-home@example.com" ] \
+  && [ "$(mcp_test_key)" = "1" ] && [ "$(ccj_email)" = "home@example.com" ] \
+  && ok "an MCP refresh in the rollback's read-back gap: token and identity both back (exit 3)" \
+  || bad "the rollback read-back gap left token and identity on different accounts" "rc=$rc ccj=$(ccj_email)"
+rm -rf "$T"
+
+# 33 — the rollback cannot read the live item (a keychain read failure, not "absent"): write nothing
+new_env; seed_live home@example.com; seed_slot work@example.com
+export STUB_STATUS_SCRIPT="$T/status-script"; printf 'ok ok fail fail fail' > "$STUB_STATUS_SCRIPT"
+export STUB_FAIL_READ_AT=4
+out=$(bash "$SCRIPT" use work --no-chrome 2>&1); rc=$?
+unset STUB_STATUS_SCRIPT STUB_FAIL_READ_AT
+[ $rc -eq 4 ] && [ "$(live_writes)" = "1" ] \
+  && [ "$(kc_get "$STUB_LIVE" .claudeAiOauth.accessToken)" = "TOK-work@example.com-slot" ] \
+  && [ "$(ccj_email)" = "work@example.com" ] \
+  && case "$out" in *"AND restoring home@example.com failed"*) true ;; *) false ;; esac \
+  && ok "an unreadable live item during rollback: exit 4, nothing overwritten, token and identity agree" \
+  || bad "an unreadable live item was overwritten during rollback" "rc=$rc writes=$(live_writes) $out"
+rm -rf "$T"
+# 33b — the forward write did not land and the classify read fails: exit 4, no second live write
+new_env; seed_live home@example.com; seed_slot work@example.com
+export STUB_FAIL_WRITE="$STUB_LIVE" STUB_FAIL_READ_AT=4
+out=$(bash "$SCRIPT" use work --no-chrome 2>&1); rc=$?
+unset STUB_FAIL_WRITE STUB_FAIL_READ_AT
+adds=$(cat "$STUB_KC.live-write-attempts" 2>/dev/null || echo 0)
+[ $rc -eq 4 ] && [ "$adds" = "1" ] && [ "$(ccj_email)" = "home@example.com" ] \
+  && case "$out" in *"could not be read back"*"claude auth login --email home@example.com"*) true ;; *) false ;; esac \
+  && ok "an unreadable live item after a failed write: exit 4, no overwrite attempted" \
+  || bad "an unreadable live item after a failed write was overwritten" "rc=$rc adds=$adds $out"
+rm -rf "$T"
+
+# 34 — list --json refuses a short array: a row that cannot be rendered fails the whole list (exit 2)
+new_env; seed_live alpha@x.test
+acct_file 'a\talpha@x.test\nb\tbeta@x.test\nc\tgamma@x.test\n'
+REAL_JQ=$(PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin command -v jq)
+printf '#!/bin/bash\ncase " $* " in *" beta@x.test "*) exit 3 ;; esac\nexec "%s" "$@"\n' "$REAL_JQ" > "$T/bin/jq"; chmod +x "$T/bin/jq"
+out=$(bash "$SCRIPT" list --json 2>/dev/null); rc=$?
+[ $rc -eq 2 ] && [ -z "$out" ] && ok "list --json with an unrenderable row: exit 2, prints no partial array" \
+  || bad "list --json printed a short array as the whole fleet" "rc=$rc out=$out"
+rm -f "$T/bin/jq"
+out=$(bash "$SCRIPT" list --json 2>/dev/null); rc=$?
+[ $rc -eq 0 ] && printf '%s' "$out" | jq -e 'length==3' >/dev/null \
+  && ok "list --json without the failing shim lists all three" || bad "list --json baseline" "rc=$rc $out"
+rm -rf "$T"
+# 34b — a refresh expiry jq prints in scientific notation (a corrupt slot) is not bash arithmetic:
+#       the row says the slot is unusable, and the rows after it are still listed
+new_env; seed_live alpha@x.test; seed_slot alpha@x.test; seed_slot beta@x.test "" 1e28; seed_slot gamma@x.test
+acct_file 'a\talpha@x.test\nb\tbeta@x.test\nc\tgamma@x.test\n'
+out=$(bash "$SCRIPT" list --json 2>/dev/null); rc=$?
+[ $rc -eq 0 ] && printf '%s' "$out" | jq -e 'length==3 and (.[1].email=="beta@x.test") and .[1].slot_ok==false
+    and (.[1].slot_problem|test("refresh-token expiry")) and .[1].refresh_until==null and .[2].email=="gamma@x.test"' >/dev/null \
+  && ok "list --json: an unreadable refresh expiry flags that slot and lists every account" \
+  || bad "list --json with an unreadable refresh expiry" "rc=$rc $out"
+out=$(bash "$SCRIPT" list 2>&1); rc=$?
+[ $rc -eq 0 ] && case "$out" in *"beta@x.test"*"unreadable refresh-token expiry"*"gamma@x.test"*) true ;; *) false ;; esac \
+  && ok "plain list: the unreadable expiry is named and the next account still prints" \
+  || bad "plain list with an unreadable refresh expiry" "rc=$rc $out"
+rm -rf "$T"
+# 34c — the loop's subshell dying mid-list prints no completeness record, so no short array passes:
+#       a `date` shim kills its parent (that subshell) on the second account's expiry lookup
+new_env; seed_live alpha@x.test; seed_slot alpha@x.test; seed_slot beta@x.test; seed_slot gamma@x.test
+acct_file 'a\talpha@x.test\nb\tbeta@x.test\nc\tgamma@x.test\n'
+printf '#!/bin/bash\nif [ "${1:-}" = -r ]; then n=$(( $(cat "%s/date-r" 2>/dev/null || echo 0) + 1 )); echo "$n" > "%s/date-r"\n  [ "$n" -eq 2 ] && kill -9 "$PPID"; fi\nexec /bin/date "$@"\n' "$T" "$T" > "$T/bin/date"; chmod +x "$T/bin/date"
+out=$(bash "$SCRIPT" list --json 2>/dev/null); rc=$?
+[ "$(cat "$T/date-r" 2>/dev/null)" -ge 2 ] 2>/dev/null && [ $rc -eq 2 ] && [ -z "$out" ] \
+  && ok "list --json: a loop killed mid-list exits 2 and prints no partial array" \
+  || bad "list --json accepted a list cut short by a killed loop" "rc=$rc date-r=$(cat "$T/date-r" 2>/dev/null) out=$out"
+rm -rf "$T"
+
+# 35 — chrome reports a failed open (exit 3); use still succeeds when only Chrome failed
+new_env; seed_live home@example.com; seed_slot work@example.com
+printf '#!/bin/bash\nexit 1\n' > "$T/bin/open"; chmod +x "$T/bin/open"
+out=$(bash "$SCRIPT" chrome work 2>&1); rc=$?
+[ $rc -eq 3 ] && case "$out" in *"could not open"*) true ;; *) false ;; esac \
+  && ok "chrome with a failing open: exit 3, says so" || bad "chrome reported success after a failed open" "rc=$rc $out"
+bash "$SCRIPT" use work >/dev/null 2>&1; rc=$?
+[ $rc -eq 0 ] && [ "$(ccj_email)" = "work@example.com" ] \
+  && ok "a failed Chrome open never fails a switch that landed" || bad "use failed on a Chrome open error" "rc=$rc"
+rm -rf "$T"
+
+# 29 — where names the credential store and reads no credential
+new_env
+out=$(bash "$SCRIPT" where 2>&1); rc=$?
+[ $rc -eq 0 ] && [ "$out" = "$(printf 'config_dir=%s\nkeychain_account=tester\nstate_dir=%s' "$CLAUDE_CONFIG_DIR" "$HOME/.local/state/claude-acct")" ] \
+  && [ ! -s "$STUB_ARGV_LOG" ] \
+  && ok "where prints config_dir, keychain_account, and state_dir, and calls security never" || bad "where" "rc=$rc $out"
+bash "$SCRIPT" where extra >/dev/null 2>&1; [ $? -eq 1 ] && ok "where refuses arguments" || bad "where took an argument"
+out=$(CLAUDE_ACCT_STATE_DIR=/x bash "$SCRIPT" where 2>&1); rc=$?
+[ $rc -eq 0 ] && [ "$(printf '%s\n' "$out" | sed -n 3p)" = "state_dir=/x" ] && [ ! -s "$STUB_ARGV_LOG" ] \
+  && ok "where honors CLAUDE_ACCT_STATE_DIR (state_dir=/x), and calls security never" || bad "where state_dir override" "rc=$rc $out"
+rm -rf "$T"
+
+# 30 — chrome opens the account's profile; no profile is exit 2; no argument is exit 1
+new_env
+out=$(bash "$SCRIPT" chrome work 2>&1); rc=$?
+[ $rc -eq 0 ] && [ "$(tr '\n' '|' < "$STUB_OPEN_LOG" 2>/dev/null)" = "-na|Google Chrome|--args|--profile-directory=Profile 1|" ] \
+  && ok "chrome work opens Profile 1" || bad "chrome did not open the profile" "rc=$rc $out"
+acct_file 'np\tnoprof@x.test\n'; : > "$STUB_OPEN_LOG"
+bash "$SCRIPT" chrome np >/dev/null 2>&1; rc=$?
+[ $rc -eq 2 ] && [ ! -s "$STUB_OPEN_LOG" ] && ok "chrome with no profile set: exit 2, opens nothing" || bad "chrome with no profile" "rc=$rc"
+bash "$SCRIPT" chrome >/dev/null 2>&1; [ $? -eq 1 ] && ok "chrome with no argument: exit 1" || bad "chrome with no argument"
 rm -rf "$T"
 
 # 16 — CLAUDE_CONFIG_DIR unset (a stock install): the Keychain service has no hash suffix and the
@@ -727,7 +1249,7 @@ bash "$SCRIPT" use work --no-chrome >/dev/null 2>&1; rc=$?
 unset CLAUDE_SECURESTORAGE_CONFIG_DIR
 rm -rf "$T"
 
-# 20 — record-limits: a statusline payload becomes the newest reading for the account it was made on
+# 36 — record-limits: a statusline payload becomes the newest reading for the account it was made on
 new_env; seed_live home@example.com
 export CLAUDE_ACCT_LIMITS_DIR="$T/limits"; L="$T/limits/latest"
 now=$(date +%s); r1=$((now + 86400)); r2=$((now + 172800))
@@ -741,11 +1263,12 @@ out=$(pay 41 "$r1" 7 | bash "$SCRIPT" record-limits 2>&1); rc=$?
   && [ "$(jq -r .five_hour_pct "$L/home@example.com.json")" = 7 ] && [ -s "$L/.since" ] \
   && ok "record-limits keeps the live account's reading, silently" \
   || bad "record-limits did not keep the live reading" "rc=$rc out=$out $(cat "$L/home@example.com.json" 2>&1)"
-case "$(bash "$SCRIPT" limits 2>&1)" in *"* home@example.com"*"41% of 7-day used"*"5-hour 7%"*) ok "limits reads what record-limits kept" ;;
-  *) bad "limits did not show the recorded reading" "$(bash "$SCRIPT" limits 2>&1)" ;; esac
+out=$(bash "$SCRIPT" limits 2>&1)
+printf '%s\n' "$out" | grep -Eq '^\* home@example\.com +59%  ' && case "$out" in *"5h: home@example.com 7%"*) true ;; *) false ;; esac \
+  && ok "limits reads what record-limits kept (59% left, 5h 7%)" || bad "limits did not show the recorded reading" "$out"
 pay 43 "$r1" | bash "$SCRIPT" record-limits
 [ "$(jq -r .seven_day_pct "$L/home@example.com.json")" = 43 ] && [ "$(jq -r .five_hour_pct "$L/home@example.com.json")" = null ] \
-  && case "$(bash "$SCRIPT" limits 2>&1)" in *"5-hour"*) false ;; *) true ;; esac \
+  && case "$(bash "$SCRIPT" limits 2>&1)" in *"5h:"*) false ;; *) true ;; esac \
   && ok "a reading with no 5-hour window (Ultra) is kept and shows no 5-hour figure" \
   || bad "a 5-hour-less reading was mishandled" "$(cat "$L/home@example.com.json")"
 printf '{"captured_at":"2026-11-05T00:00:00Z","email":"work@example.com","seven_day_pct":60,"seven_day_resets_at":%s}\n' "$r2" > "$L/work@example.com.json"
@@ -761,6 +1284,80 @@ done
 [ "$(cat "$L"/*.json)" = "$before" ] && ok "no rate_limits, garbage, or a 7-day-less payload leaves every reading alone" \
   || bad "a payload with no 7-day reading changed a file" "$(cat "$L"/*.json)"
 unset CLAUDE_ACCT_LIMITS_DIR
+rm -rf "$T"
+
+# 37 — record-limits keeps the higher percent within one reset window, and a token-launched
+#      session's reading is filed only by its reset time. Every call runs under a stand-in `claude`
+#      parent: record-limits looks for CLAUDE_CODE_OAUTH_TOKEN in the environment of each process
+#      from its parent up to the first `claude`, because Claude Code removes that variable from the
+#      statusline command's own environment. The stand-in is a symlink to node, not bash: macOS
+#      hides a system binary's environment (/bin/bash, /bin/sh) from `ps -E`, while the claude
+#      binary's is readable. Without node these cases cannot run, and they say so.
+NODE_BIN=$(PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin command -v node 2>/dev/null)
+if [ -z "$NODE_BIN" ]; then
+  printf '  SKIP 37: node not found, so the token-session stand-in cannot run (not a pass)\n'
+else
+new_env; seed_live home@example.com
+export CLAUDE_ACCT_LIMITS_DIR="$T/limits"; L="$T/limits/latest"; mkdir -p "$L"
+mkdir -p "$T/fake"; ln -sf "$NODE_BIN" "$T/fake/claude"
+FAKE_JS='const e = {...process.env}; delete e.CLAUDE_CODE_OAUTH_TOKEN;
+const r = require("child_process").spawnSync("bash", process.argv.slice(1), {stdio: "inherit", env: e});
+process.exit(r.status === null ? 1 : r.status);'
+rl() { env -u CLAUDE_CODE_OAUTH_TOKEN "$T/fake/claude" -e "$FAKE_JS" "$SCRIPT" record-limits; }
+rl_token() { env CLAUDE_CODE_OAUTH_TOKEN=test-not-a-token "$T/fake/claude" -e "$FAKE_JS" "$SCRIPT" record-limits; }
+pay2() {  # $1 7-day pct  $2 7-day reset  [$3 5-hour pct  $4 5-hour reset]
+  local fh=""; [ -n "${3:-}" ] && fh=",\"five_hour\":{\"used_percentage\":$3,\"resets_at\":$4}"
+  printf '{"version":"2.1.319","rate_limits":{"seven_day":{"used_percentage":%s,"resets_at":%s}%s}}' "$1" "$2" "$fh"
+}
+now=$(date +%s); w1=$((now + 86400)); w2=$((now + 3 * 86400)); f1=$((now + 3600)); f2=$((now + 7200))
+pay2 60 "$w1" 30 "$f1" | rl; pay2 40 "$w1" 20 "$f1" | rl
+[ "$(jq -c '[.seven_day_pct,.five_hour_pct]' "$L/home@example.com.json")" = "[60,30]" ] \
+  && ok "60 then 40 in one 7-day window keeps 60; 30 then 20 in one 5-hour window keeps 30" \
+  || bad "a lower reading in the same window replaced a higher one" "$(cat "$L/home@example.com.json")"
+pay2 65 "$w1" 35 "$f1" | rl
+[ "$(jq -c '[.seven_day_pct,.five_hour_pct]' "$L/home@example.com.json")" = "[65,35]" ] \
+  && ok "a higher reading in the window still replaces the stored one" || bad "a higher reading was dropped" "$(cat "$L/home@example.com.json")"
+pay2 50 "$w1" 2 "$f2" | rl
+[ "$(jq -c '[.seven_day_pct,.five_hour_pct,.five_hour_resets_at]' "$L/home@example.com.json")" = "[65,2,$f2]" ] \
+  && ok "a new 5-hour window takes its lower figure while the 7-day max holds" || bad "5-hour window change" "$(cat "$L/home@example.com.json")"
+pay2 3 "$w2" | rl
+[ "$(jq -c '[.seven_day_pct,.seven_day_resets_at]' "$L/home@example.com.json")" = "[3,$w2]" ] \
+  && ok "a new 7-day window takes its own lower figure" || bad "7-day window change" "$(cat "$L/home@example.com.json")"
+# Token sessions. home@ now sits in window w2; work@ has its own window w3.
+w3=$((now + 5 * 86400))
+printf '{"captured_at":"2026-11-05T00:00:00Z","email":"work@example.com","seven_day_pct":10,"seven_day_resets_at":%s}\n' "$w3" > "$L/work@example.com.json"
+before=$(cat "$L"/*.json)
+out=$(pay2 88 $((now + 9 * 86400)) | rl_token 2>&1); rc=$?
+[ $rc -eq 0 ] && [ -z "$out" ] && [ "$(cat "$L"/*.json)" = "$before" ] \
+  && ok "a token session whose reset matches no account writes nothing, silently" \
+  || bad "an unmatched token-session reading was filed" "rc=$rc out=$out $(cat "$L"/*.json)"
+pay2 4 "$w2" | rl_token
+[ "$(jq -r .seven_day_pct "$L/home@example.com.json")" = 4 ] \
+  && ok "a token session in the live account's window is the live account's" || bad "token reading in the live window" "$(cat "$L/home@example.com.json")"
+pay2 12 "$w3" | rl_token
+[ "$(jq -r .seven_day_pct "$L/work@example.com.json")" = 12 ] && [ "$(jq -r .seven_day_pct "$L/home@example.com.json")" = 4 ] \
+  && ok "a token session in another account's window is that account's" || bad "token reading in another window" "$(cat "$L"/*.json)"
+pay2 9 $((now + 9 * 86400)) | rl
+[ "$(jq -r .seven_day_pct "$L/home@example.com.json")" = 9 ] \
+  && ok "without a token the same unmatched reading still goes to the live account" || bad "non-token unmatched reading" "$(cat "$L/home@example.com.json")"
+# The per-account lock: a fresh one held by another writer skips this write and stays; a stale one
+# (older than a minute) is cleared, the write lands, and the lock is released.
+w9=$((now + 9 * 86400))
+mkdir "$L/.home@example.com.lock"
+pay2 20 "$w9" | rl
+[ "$(jq -r .seven_day_pct "$L/home@example.com.json")" = 9 ] && [ -d "$L/.home@example.com.lock" ] \
+  && ok "a held lock skips the write and is left to its holder" || bad "held lock" "$(cat "$L/home@example.com.json")"
+touch -t 202001010000 "$L/.home@example.com.lock"
+pay2 21 "$w9" | rl
+[ "$(jq -r .seven_day_pct "$L/home@example.com.json")" = 9 ] && [ ! -d "$L/.home@example.com.lock" ] \
+  && ok "a stale lock is cleared and that reading skipped, so two clearers never both write" \
+  || bad "stale lock clear" "$(cat "$L/home@example.com.json")"
+pay2 22 "$w9" | rl
+[ "$(jq -r .seven_day_pct "$L/home@example.com.json")" = 22 ] && [ ! -d "$L/.home@example.com.lock" ] \
+  && ok "the next reading takes the freed lock, writes, and releases it" || bad "write after a stale clear" "$(cat "$L/home@example.com.json")"
+unset CLAUDE_ACCT_LIMITS_DIR
+rm -rf "$T"
+fi
 rm -rf "$T"
 
 printf '\n  %d passed, %d failed\n' "$PASS" "$FAIL"
