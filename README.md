@@ -35,8 +35,12 @@ The profile directory is the last segment of "Profile Path" on `chrome://version
 ```
 claude-acct.sh add you@company.example   # once per account: browser sign-in in that account's Chrome profile
 claude-acct.sh list                      # saved accounts, which is live, refresh-token expiry (~4 weeks)
+claude-acct.sh list --json               # the same as one JSON array, for a script; no credential
 claude-acct.sh use work                  # switch
+claude-acct.sh use work --expect-from you@personal.example   # refuse unless that account is live
 claude-acct.sh whoami
+claude-acct.sh where                     # the config dir, keychain account, and state dir in use
+claude-acct.sh chrome work               # open that account's Chrome profile
 claude-acct.sh limits                    # 7-day (and 5-hour, where the plan has one) quota per account
 claude-acct.sh usage --days 7            # transcript tokens per account, attributed by switch time
 ```
@@ -56,10 +60,16 @@ printf '%s' "$input" | claude-acct.sh record-limits    # prints nothing, always 
 
 A reading is filed under the account whose 7-day reset time it carries when that matches exactly one other known account (a session that had not followed a switch yet), and under the live account otherwise. Accounts you have not used since recording began say "no reading", never 0%.
 
+Within one reset window the used percent never goes down, so `record-limits` keeps the higher figure: a lower reading carrying the same 7-day reset time is a stale or out-of-order one and does not replace it. The 5-hour figure works the same way, keyed on its own reset time. (Reported by Mark Pavlyukovskyy, who saw 60% recorded and then 40% in one window.)
+
+A session started with `CLAUDE_CODE_OAUTH_TOKEN` runs on that token's account, which `.claude.json` never names. Claude Code also removes that variable from the statusline command's environment (measured on 2.1.319), so `record-limits` looks for it in the environment of each process from its parent up to the first `claude` process, counting matches only and never reading the value out. Such a reading is filed only when its 7-day reset time matches exactly one known account; otherwise it is dropped, never filed under the live account. (Also reported by Mark.)
+
+`limits` cannot show a per-model weekly cap such as Fable's: the statusline payload's `rate_limits` carries only `five_hour`, `seven_day`, and `spend_limit` (2.1.319), so a session can hit a per-model cap while these numbers still show headroom. The `limits` footer says so. Claude Code's own `/usage` reads per-model figures from the OAuth usage API, which this script does not call.
+
 ## What follows a switch
 
 - New sessions: immediately.
-- Running sessions: at their next request. Before each request Claude Code re-reads the Keychain login and adopts a changed one. Measured on 2.1.317 with no restart: running sessions' quota readings moved to the new account within about two minutes. An idle session moves when next used; for one that did not, `/exit` then `claude --continue` moves it with its conversation intact.
+- Running sessions: at their next request. Before each request Claude Code re-reads the Keychain login and adopts a changed one. Measured on 2.1.317 with no restart: running sessions' quota readings moved to the new account within about two minutes. Mark Pavlyukovskyy saw the same on 2.1.316 and 2.1.319, and on Linux on 2.1.283, where swapping `.credentials.json` moved running sessions the same way. An idle session moves when next used; for one that did not, `/exit` then `claude --continue` moves it with its conversation intact.
 - Anything started with `CLAUDE_CODE_OAUTH_TOKEN`, and sandboxed launchd jobs that cannot reach the Keychain: never.
 - If `<config dir>/.credentials.json` exists (Claude Code's plaintext fallback when a Keychain write fails), running sessions watch that file instead of the Keychain and stop following. Move it aside; `use` warns when it is present.
 
