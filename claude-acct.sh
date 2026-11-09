@@ -717,6 +717,15 @@ cmd_list() {
     1:--json) json=1 ;;
     *) die 1 "usage: claude-acct.sh list [--json]" ;;
   esac
+  # A caller reads the JSON array as the whole fleet, so a source of the account list that
+  # exists but cannot be read refuses the list instead of silently shortening it.
+  if [ "$json" -eq 1 ]; then
+    if { [ -e "$CONF" ] && [ ! -r "$CONF" ]; } \
+       || { [ -e "$SWITCHES" ] && ! jq empty "$SWITCHES" >/dev/null 2>&1; }; then
+      note "list --json: the accounts file or switch log cannot be read; nothing printed"
+      exit 2
+    fi
+  fi
   local cur; cur=$(live_email)
   if [ -z "$cur" ]; then
     local _st; _st=$(live_state)

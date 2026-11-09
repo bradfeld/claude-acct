@@ -1190,6 +1190,26 @@ out=$(bash "$SCRIPT" list --json 2>/dev/null); rc=$?
   || bad "list --json accepted a list cut short by a killed loop" "rc=$rc date-r=$(cat "$T/date-r" 2>/dev/null) out=$out"
 rm -rf "$T"
 
+# 34d — list --json refuses when a source of the account list cannot be read: a corrupt
+#       switches log or an unreadable accounts file would otherwise drop accounts and still
+#       print a "complete" shorter array
+new_env; seed_live alpha@x.test; seed_slot alpha@x.test; seed_slot beta@x.test
+acct_file 'a\talpha@x.test\nb\tbeta@x.test\n'
+mkdir -p "$HOME/.local/state/claude-acct"; printf '{"from":"alpha@x.test","to":"gamma@x.test"}\n{not json\n' > "$HOME/.local/state/claude-acct/switches.jsonl"
+out=$(bash "$SCRIPT" list --json 2>/dev/null); rc=$?
+[ $rc -eq 2 ] && [ -z "$out" ] && ok "list --json with a corrupt switches log: exit 2, prints no array" \
+  || bad "list --json read past a corrupt switches log" "rc=$rc out=$out"
+rm -f "$HOME/.local/state/claude-acct/switches.jsonl"
+out=$(bash "$SCRIPT" list --json 2>/dev/null); rc=$?
+[ $rc -eq 0 ] && printf '%s' "$out" | jq -e 'length==2' >/dev/null && ok "list --json without the corrupt log lists both" \
+  || bad "list --json baseline after removing the corrupt log" "rc=$rc $out"
+chmod 000 "$HOME/.config/claude-acct/accounts"
+out=$(bash "$SCRIPT" list --json 2>/dev/null); rc=$?
+chmod 600 "$HOME/.config/claude-acct/accounts"
+[ $rc -eq 2 ] && [ -z "$out" ] && ok "list --json with an unreadable accounts file: exit 2, prints no array" \
+  || bad "list --json read past an unreadable accounts file" "rc=$rc out=$out"
+rm -rf "$T"
+
 # 35 — chrome reports a failed open (exit 3); use still succeeds when only Chrome failed
 new_env; seed_live home@example.com; seed_slot work@example.com
 printf '#!/bin/bash\nexit 1\n' > "$T/bin/open"; chmod +x "$T/bin/open"
